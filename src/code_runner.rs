@@ -14,12 +14,15 @@ use ramemu::registers::Registers;
 
 use yew::{html::Scope, prelude::*};
 
+use futures_timer::Delay; // You need the futures_timer crate for async delay
+use std::time::Duration;
+
 pub enum Msg {
-    RunCode(String),
     DebugStart(String),
     DebugStep,
     DebugStop,
     DebugContinue,
+    DebugContinueStep,
     WriterWrote(String),
     InputChanged(String),
 }
@@ -37,11 +40,12 @@ pub struct CodeRunner {
     stdout: String,
     reader: CustomReader,
     writer: CustomWriter,
-    debug: Option<DebugState>,
+    debug: Option<State>,
 }
 
-struct DebugState {
-    ram: Ram,
+enum State {
+    DebugContinue(Ram),
+    DebugPause(Ram),
 }
 
 impl Component for CodeRunner {
@@ -88,30 +92,6 @@ impl Component for CodeRunner {
 
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
         match msg {
-            Msg::RunCode(code) => {
-                log::info!("Run Code");
-
-                if self.debug.is_some() {
-                    ctx.link().send_message(Msg::DebugContinue);
-                    return false;
-                }
-
-                self.stdout.clear();
-                match Program::from_source(&code) {
-                    Ok(program) => {
-                        let mut ram = Ram::new(
-                            program,
-                            Box::new(self.reader.clone()),
-                            Box::new(self.writer.clone()),
-                        );
-                        self.error = ram.run().err().map(OutputComponentErrors::InterpretError);
-                        let state: RamState = ram.into();
-
-                        ctx.props().set_memory.emit(state.registers);
-                    }
-                    Err(e) => self.error = Some(OutputComponentErrors::ParseError(e)),
-                };
-            }
             Msg::DebugStart(code) => {
                 log::info!("Debug Start");
 
@@ -124,7 +104,7 @@ impl Component for CodeRunner {
                             Box::new(self.writer.clone()),
                         );
 
-                        self.debug = Some(DebugState { ram });
+                        self.debug = Some(State::DebugContinue(ram));
 
                         ctx.props().set_read_only.emit(true);
 
@@ -136,10 +116,10 @@ impl Component for CodeRunner {
             Msg::DebugStep => {
                 log::info!("Debug Step");
 
-                if let Some(debug) = self.debug.as_mut() {
-                    debug.ram.next();
+                if let Some(State::DebugPause(ram)) = self.debug.as_mut() {
+                    ram.next();
 
-                    let state: RamState = (&debug.ram).into();
+                    let state: RamState = (&*ram).into();
 
                     ctx.props().set_memory.emit(state.registers);
                     // ctx.props().set_line.emit(state.line);
@@ -152,8 +132,8 @@ impl Component for CodeRunner {
             Msg::DebugContinue => {
                 log::info!("Debug Continue");
 
-                if let Some(debug) = self.debug.as_mut() {
-                    for result in debug.ram.by_ref() {
+                if let Some(State::DebugContinue(ram)) = self.debug.as_mut() {
+                    for result in ram.by_ref() {
                         let breakpoints = &ctx.props().breakpoints;
                         match result {
                             Ok(state) if breakpoints.contains(&state.line) => break,
@@ -162,7 +142,7 @@ impl Component for CodeRunner {
                         }
                     }
 
-                    let state: RamState = (&debug.ram).into();
+                    let state: RamState = ram.into();
 
                     ctx.props().set_memory.emit(state.registers);
                     // ctx.props().set_line.emit(state.line);
@@ -172,13 +152,44 @@ impl Component for CodeRunner {
                     }
                 }
             }
+            Msg::DebugContinueStep => {
+                if let Some(State::DebugContinue(ram)) = self.debug.as_mut() {
+                    let breakpoints = &ctx.props().breakpoints;
+                    let mut should_continue = true;
+                    match ram.next() {
+                        Some(Ok(state)) if breakpoints.contains(&state.line) => {
+                            should_continue = false
+                        }
+                        Some(Err(_)) => should_continue = false,
+                        _ => {}
+                    }
+
+                    if should_continue {
+                        let delay = Delay::new(Duration::from_millis(10));
+                        let scope = ctx.link().clone();
+                        wasm_bindgen_futures::spawn_local(async move {
+                            delay.await;
+                            scope.send_message(Msg::DebugContinueStep);
+                        });
+                    } else {
+                        let state: RamState = (&*ram).into();
+
+                        ctx.props().set_memory.emit(state.registers);
+                        // ctx.props().set_line.emit(state.line);
+
+                        if state.halt {
+                            ctx.link().send_message(Msg::DebugStop);
+                        }
+                    }
+                }
+            }
             Msg::DebugStop => {
                 log::info!("Debug Stop");
 
                 ctx.props().set_read_only.emit(false);
 
-                if let Some(debug) = self.debug.take() {
-                    let state: RamState = debug.ram.into();
+                if let Some(State::DebugContinue(ram)) = self.debug.take() {
+                    let state: RamState = ram.into();
                     self.error = state.error.map(OutputComponentErrors::InterpretError);
 
                     ctx.props().set_memory.emit(state.registers);
